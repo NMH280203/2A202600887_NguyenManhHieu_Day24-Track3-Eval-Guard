@@ -5,6 +5,4 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-answers_50q.json
-reports/*.json
-!reports/.gitkeep
+# Lab deliverables (answers and generated reports) are intentionally tracked.

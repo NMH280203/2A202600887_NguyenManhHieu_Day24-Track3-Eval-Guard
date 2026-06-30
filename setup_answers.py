@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,7 +103,64 @@ def run_query(q: str, search, reranker, top_k: int) -> tuple[str, list[str]]:
     return (contexts[0] if contexts else "Không tìm thấy thông tin."), contexts
 
 
+def build_offline_pipeline():
+    """Build a local BM25-only pipeline for CI or machines without Qdrant/API."""
+    from src.m1_chunking import load_documents, chunk_hierarchical
+    from src.m2_search import BM25Search
+
+    chunks = []
+    for document in load_documents():
+        _, children = chunk_hierarchical(
+            document["text"], child_size=500, metadata=document["metadata"]
+        )
+        chunks.extend({
+            "text": child.text,
+            "metadata": {**child.metadata, "parent_id": child.parent_id},
+        } for child in children)
+    search = BM25Search()
+    search.index(chunks)
+    print(f"  ✓ Offline BM25 indexed {len(chunks)} chunks")
+    return search
+
+
+def _content_tokens(text: str) -> set[str]:
+    text = unicodedata.normalize("NFKC", text).lower()
+    stop = {"là", "của", "có", "được", "bao", "nhiêu", "và", "trong", "khi",
+            "theo", "cho", "nhân", "viên", "một", "những", "các", "gì"}
+    return {token for token in re.findall(r"[\w%]+", text, flags=re.UNICODE)
+            if len(token) > 1 and token not in stop}
+
+
+def run_query_offline(q: str, search, top_k: int = 3) -> tuple[str, list[str]]:
+    """Retrieve locally and form a concise extractive answer."""
+    results = search.search(q, top_k=max(top_k, 5))
+    contexts = [result.text for result in results[:top_k]]
+    q_tokens = _content_tokens(q)
+    candidates = []
+    for context_index, context in enumerate(contexts):
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", context):
+            sentence = sentence.strip(" -\t")
+            if len(sentence) < 20:
+                continue
+            tokens = _content_tokens(sentence)
+            overlap = len(q_tokens & tokens) / max(len(q_tokens), 1)
+            number_bonus = 0.05 if re.search(r"\d", sentence) else 0.0
+            candidates.append((overlap + number_bonus - context_index * 0.01, sentence))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = []
+    for _, sentence in candidates:
+        if sentence not in selected:
+            selected.append(sentence)
+        if len(selected) == 2:
+            break
+    answer = " ".join(selected) if selected else (
+        contexts[0] if contexts else "Không tìm thấy thông tin."
+    )
+    return answer, contexts
+
+
 def main():
+    offline = "--offline" in sys.argv or os.getenv("OFFLINE_MODE", "0") == "1"
     print("=" * 60)
     print("LAB 24 SETUP — Generating answers for 50 questions")
     print("=" * 60)
@@ -113,19 +172,28 @@ def main():
         test_set = json.load(f)
     print(f"✓ Loaded {len(test_set)} questions (factual/multi_hop/adversarial)")
 
-    try:
-        search, reranker, top_k = build_pipeline()
-    except ImportError as e:
-        print(f"\n❌ Import error: {e}")
-        print("→ Đảm bảo bạn đã copy src/ từ Day 18 và đã pip install -r requirements.txt")
-        sys.exit(1)
+    if offline:
+        print("\n[Offline mode] Không dùng Qdrant, embedding model hoặc OpenAI.")
+        search = build_offline_pipeline()
+        reranker, top_k = None, 3
+    else:
+        try:
+            search, reranker, top_k = build_pipeline()
+        except Exception as e:
+            print(f"\n⚠️  Full pipeline unavailable ({type(e).__name__}: {e})")
+            print("→ Falling back to local BM25 pipeline.")
+            search = build_offline_pipeline()
+            reranker, top_k, offline = None, 3, True
 
     print(f"\nRunning {len(test_set)} queries...")
     answers = []
     t_start = time.time()
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker, top_k)
+        if offline:
+            answer, contexts = run_query_offline(item["question"], search, top_k)
+        else:
+            answer, contexts = run_query(item["question"], search, reranker, top_k)
         answers.append({
             "id":           item["id"],
             "distribution": item["distribution"],

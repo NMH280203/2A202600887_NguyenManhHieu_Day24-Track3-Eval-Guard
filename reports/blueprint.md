@@ -1,7 +1,8 @@
 # CI/CD Blueprint: RAG Eval + Guardrail Stack
 
-**Sinh viên:** [Họ Tên]  
-**Ngày:** [Ngày làm lab]
+**Sinh viên:** Nguyen Manh Hieu — 2A202600887
+
+**Ngày:** 2026-06-30
 
 ---
 
@@ -10,11 +11,11 @@
 ```
 User Input
     │
-    ▼ (~?ms P95)
+    ▼ (6.55ms P95)
 [Presidio PII Scan]
     │ block if: VN_CCCD / VN_PHONE / EMAIL detected
     │ action:   return 400 + "PII detected in query"
-    ▼ (~?ms P95)
+    ▼ (0.04ms P95 trong offline rule-precheck; NeMo LLM đo riêng khi deploy)
 [NeMo Input Rail]
     │ block if: off-topic / jailbreak / prompt injection
     │ action:   return 503 + refuse message
@@ -33,18 +34,17 @@ User Response
 
 ## Latency Budget
 
-*(Điền từ kết quả Task 12 — measure_p95_latency())*
-
 | Layer | P50 (ms) | P95 (ms) | P99 (ms) | Budget |
 |---|---|---|---|---|
-| Presidio PII | ? | ? | ? | <10ms |
-| NeMo Input Rail | ? | ? | ? | <300ms |
-| RAG Pipeline | ? | ? | ? | <2000ms |
-| NeMo Output Rail | ? | ? | ? | <300ms |
-| **Total Guard** | ? | **?** | ? | **<500ms** |
+| Presidio PII | 5.90 | 6.55 | 6.55 | <10ms |
+| Input rule precheck | 0.03 | 0.04 | 0.04 | <300ms |
+| RAG Pipeline | N/A (evaluated separately) | N/A | N/A | <2000ms |
+| NeMo Output Rail | Chưa đo online | Chưa đo online | Chưa đo online | <300ms |
+| **Total input guard** | 5.94 | **6.58** | 6.58 | **<500ms** |
 
-**Budget OK?** [ ] Yes / [ ] No  
-**Comment:** [Nếu vượt budget, layer nào là bottleneck và cách tối ưu?]
+**Budget OK?** [x] Yes / [ ] No
+
+**Comment:** Số đo trên là Presidio + deterministic input precheck vì NeMo/LangChain hiện không tương thích Python 3.14 của máy chạy. Gate production phải đo lại NeMo LLM trên image Python 3.11 trước khi merge.
 
 ---
 
@@ -53,14 +53,14 @@ User Response
 ```yaml
 # .github/workflows/rag_eval.yml
 - name: RAGAS Quality Gate
-  run: python src/phase_a_ragas.py
+  run: RAGAS_MODE=auto python src/phase_a_ragas.py
   env:
     MIN_FAITHFULNESS: 0.75
     MIN_AVG_SCORE: 0.65
 
 - name: Guardrail Gate
-  run: pytest tests/test_phase_c.py -k "test_adversarial_suite_pass_rate"
-  # phải ≥ 15/20 (75%)
+  run: python -m pytest tests/test_phase_c.py -k "test_adversarial_suite_pass_rate"
+  # production target ≥ 18/20 (90%); lab minimum 15/20
 
 - name: Latency Gate
   run: python -c "from src.phase_c_guard import measure_p95_latency; ..."
@@ -74,6 +74,7 @@ User Response
 | Metric | Alert Threshold | Action |
 |---|---|---|
 | RAGAS faithfulness (daily sample) | < 0.70 | Page on-call |
+| RAGAS answer relevancy | < 0.60 | Review prompts and failed samples |
 | Adversarial block rate | < 80% | Review new attack patterns |
 | Guard P95 latency | > 600ms | Scale NeMo model |
 | PII detected count | spike >10/hour | Security alert |
@@ -84,16 +85,15 @@ User Response
 
 | | Kết quả |
 |---|---|
-| RAGAS avg_score (50q) | ? |
-| Worst metric | ? |
-| Dominant failure distribution | ? |
-| Cohen's κ | ? |
-| Adversarial pass rate | ? / 20 |
-| Guard P95 latency | ? ms |
+| RAGAS-compatible avg_score (50q) | 0.6669 (lexical fallback run) |
+| Worst metric | context_precision (47/50 câu) |
+| Dominant failure distribution | factual theo raw count; adversarial theo failure rate/avg score |
+| Cohen's κ | 0.8000 |
+| Adversarial pass rate | 20/20 (100%) |
+| Guard P95 latency | 6.58ms (input guard offline) |
 
 ---
 
 ## Nhận xét & Cải tiến
 
-> [Viết 3-5 câu về: điều gì hoạt động tốt, điều gì cần cải thiện,
->  nếu deploy production thực sự bạn sẽ thay đổi gì trong stack này?]
+Lab đã triển khai đủ ba lớp eval/guard và có fallback để CI không phụ thuộc dịch vụ ngoài. Lần chạy hiện tại cho thấy Presidio P95 6.87ms, adversarial pass 100%, nhưng context precision chỉ 0.3014 toàn tập. Ưu tiên tiếp theo là metadata filter cho policy version, cross-encoder reranking và query decomposition cho multi-hop. Trước production cần chạy lại RAGAS và NeMo bằng LLM thật trên Python 3.11, lưu baseline riêng và không trộn số liệu fallback với số liệu online.
